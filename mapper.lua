@@ -1,54 +1,13 @@
---=====================================================================
---=====================================================================
---                                                                    --
---  WINGS OF GLORY - DEEP GAME MAPPER                                 --
---  =================================                                 --
---                                                                    --
---  Exhaustive read-only reconnaissance with multi-file output.       --
---                                                                    --
---  OUTPUT FILES (written to executor workspace folder):              --
---                                                                    --
---    wogmap.txt          full combined report (everything)         --
---    wog_remotes.txt     every RemoteEvent/RemoteFunction with      --
---                        full paths, grouped by container           --
---    wog_scripts.txt     every LocalScript/ModuleScript/Script      --
---                        with full paths, grouped by location       --
---    wog_guitext.txt    every text label/button/box in live GUI     --
---    wog_values.txt     every Value object content (PartOf tags,    --
---                        landing_tire flags, etc)                   --
---    wog_structure.txt  the full workspace/service tree             --
---    wog_summary.txt    the stats + full remote + script lists       --
---                                                                    --
---  INTERACTIVE COMMANDS (after scan):                               --
---    MAP.sections()       list section locations                    --
---    MAP.get(tag)         print a section                           --
---    MAP.copy(tag)        copy a section to clipboard                --
---    MAP.find(text)       search the entire report                  --
---    MAP.stats()          the numbers                                --
---    MAP.save()           rewrite all files                         --
---                                                                    --
---  TARGET    : UNC-compatible executors + Studio                     --
---  LICENSE   : MIT                                                   --
---                                                                    --
---=====================================================================
---=====================================================================
+-- SIMPLYSPY MAPPER v3 BULLETPROOF
+-- first line of execution: identity check
+print("[MAPPER] v3 bulletproof booting")
 
 ---------------------------------------------------------------------
--- SECTION 1 : BOOTSTRAP
----------------------------------------------------------------------
-
-local TAG = "[WOG-Map]"
-
-local function log(msg)
-    print(TAG .. " " .. tostring(msg))
-end
-
----------------------------------------------------------------------
--- SECTION 2 : CONFIGURATION
+-- CONFIG
 ---------------------------------------------------------------------
 
 local CFG = {
-    MAX_CHILDREN_PER_NODE = 0,
+    MAX_CHILDREN_PER_NODE = 0,     -- 0 = uncapped
     YIELD_EVERY = 500,
     PROPERTY_DUMP = true,
     GUI_TEXT = true,
@@ -56,7 +15,6 @@ local CFG = {
     DEDUP_SIBLINGS = true,
     DEDUP_MAX_SAMPLE = 3,
 
-    -- Output files
     FILES = {
         FULL      = "wogmap.txt",
         REMOTES   = "wog_remotes.txt",
@@ -69,17 +27,43 @@ local CFG = {
 }
 
 ---------------------------------------------------------------------
--- SECTION 3 : REPORT BUFFERS
+-- SAFE PRIMITIVES (everything routes through these)
 ---------------------------------------------------------------------
--- One buffer per output file, plus the combined report.
 
-local report = {}        -- combined (wogmap.txt)
-local remotesOut = {}   -- wog_remotes.txt
-local scriptsOut = {}   -- wog_scripts.txt
-local guiTextOut = {}   -- wog_guitext.txt
-local valuesOut = {}    -- wog_values.txt
-local structureOut = {} -- wog_structure.txt
-local summaryOut = {}   -- wog_summary.txt
+local function safe(f, ...)
+    local ok, result = pcall(f, ...)
+    if ok then
+        return result
+    end
+    return nil
+end
+
+local function safeYield()
+    if task and task.wait then
+        task.wait()
+    else
+        wait()
+    end
+end
+
+local function canWrite()
+    return type(writefile) == "function"
+end
+
+local function canClip()
+    return type(setclipboard) == "function"
+end
+
+---------------------------------------------------------------------
+-- BUFFERS
+---------------------------------------------------------------------
+
+local report = {}
+local structureOut = {}
+local remotesByContainer = {}
+local scriptsByLocation = {}
+local guiTexts = {}
+local valueObjects = {}
 
 local lineCount = 0
 local sectionStart = {}
@@ -88,6 +72,7 @@ local sectionEnd = {}
 local function emit(line)
     lineCount = lineCount + 1
     table.insert(report, line)
+    table.insert(structureOut, line)
 end
 
 local function beginSection(tag, title)
@@ -101,42 +86,8 @@ local function endSection(tag)
 end
 
 ---------------------------------------------------------------------
--- SECTION 4 : HELPERS
+-- STATS
 ---------------------------------------------------------------------
-
-local function safe(f, ...)
-    local ok, result = pcall(f, ...)
-    if ok then
-        return result
-    end
-    return nil
-end
-
-local function classify(inst)
-    if inst:IsA("RemoteEvent") then return "REMOTE_EVENT"
-    elseif inst:IsA("RemoteFunction") then return "REMOTE_FUNCTION"
-    elseif inst:IsA("UnreliableRemoteEvent") then return "REMOTE_UNRELIABLE"
-    elseif inst:IsA("LocalScript") then return "LOCAL_SCRIPT"
-    elseif inst:IsA("ModuleScript") then return "MODULE_SCRIPT"
-    elseif inst:IsA("Script") then return "SERVER_SCRIPT"
-    elseif inst:IsA("Tool") then return "TOOL"
-    elseif inst:IsA("BasePart") then return "PART"
-    elseif inst:IsA("Humanoid") then return "HUMANOID"
-    end
-    return nil
-end
-
----------------------------------------------------------------------
--- SECTION 5 : CATEGORIZED COLLECTION
----------------------------------------------------------------------
--- Every interesting instance is collected into its category list
--- as we walk, so the per-file outputs are complete regardless of
--- where in the tree the instance lives.
-
-local remotesByContainer = {}   -- container path -> {entries}
-local scriptsByLocation = {}    -- location label -> {entries}
-local guiTexts = {}             -- {path, text}
-local valueObjects = []         -- {path, type, value}
 
 local stats = {
     nodes = 0,
@@ -145,17 +96,42 @@ local stats = {
     parts = 0,
     tools = 0,
     maxDepth = 0,
+    errors = 0,
 }
 
+---------------------------------------------------------------------
+-- CLASSIFICATION (fully pcalled: a locked-down instance cannot
+-- crash the walker)
+---------------------------------------------------------------------
+
+local function classify(inst)
+    local r = safe(function()
+        if inst:IsA("RemoteEvent") then return "REMOTE_EVENT"
+        elseif inst:IsA("RemoteFunction") then return "REMOTE_FUNCTION"
+        elseif inst:IsA("UnreliableRemoteEvent") then return "REMOTE_UNRELIABLE"
+        elseif inst:IsA("LocalScript") then return "LOCAL_SCRIPT"
+        elseif inst:IsA("ModuleScript") then return "MODULE_SCRIPT"
+        elseif inst:IsA("Script") then return "SERVER_SCRIPT"
+        elseif inst:IsA("Tool") then return "TOOL"
+        elseif inst:IsA("BasePart") then return "PART"
+        elseif inst:IsA("Humanoid") then return "HUMANOID"
+        end
+        return nil
+    end)
+    return r
+end
+
+---------------------------------------------------------------------
+-- COLLECTORS
+---------------------------------------------------------------------
+
 local function containerPathOf(inst)
-    local parent = inst.Parent
-    if not parent then
-        return "(no parent)"
-    end
-    if parent == game then
-        return "game"
-    end
-    return parent:GetFullName()
+    return safe(function()
+        local parent = inst.Parent
+        if not parent then return "(no parent)" end
+        if parent == game then return "game" end
+        return parent:GetFullName()
+    end) or "?"
 end
 
 local function noteRemote(inst, kind)
@@ -164,12 +140,15 @@ local function noteRemote(inst, kind)
     if not remotesByContainer[container] then
         remotesByContainer[container] = {}
     end
+    local name = safe(function() return inst.Name end) or "?"
     table.insert(remotesByContainer[container],
-        string.format("%s  %s", inst.Name, kind))
+        name .. "  " .. kind)
 end
 
 local function locationLabelOf(inst)
-    local path = inst:GetFullName()
+    local path = safe(function()
+        return inst:GetFullName()
+    end) or ""
     if path:find("^Workspace") then
         return "Workspace"
     elseif path:find("^ReplicatedStorage") then
@@ -193,8 +172,11 @@ local function noteScript(inst, kind)
     if not scriptsByLocation[location] then
         scriptsByLocation[location] = {}
     end
+    local path = safe(function()
+        return inst:GetFullName()
+    end) or "?"
     table.insert(scriptsByLocation[location],
-        string.format("%s  %s", inst:GetFullName(), kind))
+        path .. "  " .. kind)
 end
 
 local function noteGuiText(inst)
@@ -205,8 +187,11 @@ local function noteGuiText(inst)
     if #text > CFG.MAX_TEXT_LEN then
         text = text:sub(1, CFG.MAX_TEXT_LEN) .. "..."
     end
+    local path = safe(function()
+        return inst:GetFullName()
+    end) or "?"
     table.insert(guiTexts,
-        string.format("%s: \"%s\"", inst:GetFullName(), text))
+        path .. ': "' .. text .. '"')
 end
 
 local function noteValueObject(inst)
@@ -218,12 +203,17 @@ local function noteValueObject(inst)
     if #s > CFG.MAX_TEXT_LEN then
         s = s:sub(1, CFG.MAX_TEXT_LEN) .. "..."
     end
-    table.insert(valueObjects, string.format("%s  <%s> = %s",
-        inst:GetFullName(), inst.ClassName, s))
+    local path = safe(function()
+        return inst:GetFullName()
+    end) or "?"
+    local cls = safe(function() return inst.ClassName end)
+        or "Value"
+    table.insert(valueObjects,
+        path .. "  <" .. cls .. "> = " .. s)
 end
 
 ---------------------------------------------------------------------
--- SECTION 6 : PROPERTY DUMPS
+-- PROPERTY DUMP
 ---------------------------------------------------------------------
 
 local function interestingProps(inst)
@@ -237,29 +227,31 @@ local function interestingProps(inst)
                 v = v:sub(1, CFG.MAX_TEXT_LEN) .. "..."
             end
             table.insert(props, prop .. "=" .. v)
-        elseif type(v) == "number" or type(v) == "boolean" then
+        elseif type(v) == "number"
+            or type(v) == "boolean" then
             table.insert(props, prop .. "=" .. tostring(v))
         elseif type(v) == "Instance" then
-            table.insert(props, prop .. "=" .. v.Name)
+            table.insert(props,
+                prop .. "=" .. tostring(v.Name))
         end
     end
 
-    if inst:IsA("BasePart") then
+    local isPart = safe(function() return inst:IsA("BasePart") end)
+    local isHumanoid = safe(function()
+        return inst:IsA("Humanoid") end)
+
+    if isPart then
         try("Anchored")
         try("CanCollide")
         try("Transparency")
-    elseif inst:IsA("Humanoid") then
+    elseif isHumanoid then
         try("Health")
         try("MaxHealth")
         try("WalkSpeed")
-    elseif inst:IsA("Sound") then
-        try("SoundId")
-    elseif inst:IsA("Tool") then
-        try("ToolTip")
     end
 
     local attrs = safe(inst.GetAttributes, inst)
-    if attrs then
+    if type(attrs) == "table" then
         for k, v in pairs(attrs) do
             local s = tostring(v)
             if #s > CFG.MAX_TEXT_LEN then
@@ -273,8 +265,9 @@ local function interestingProps(inst)
 end
 
 ---------------------------------------------------------------------
--- SECTION 7 : DEDUP WALKER
------------------------------------------------------------------------
+-- THE WALKER (bulletproof: every access pcalled, every error
+-- counted, the walk never stops for a bad instance)
+---------------------------------------------------------------------
 
 local function walk(inst, depth, prefix)
     stats.nodes = stats.nodes + 1
@@ -282,9 +275,17 @@ local function walk(inst, depth, prefix)
         stats.maxDepth = depth
     end
 
+    -- Name: safe access.
+    local name = safe(function() return inst.Name end) or "?"
+
+    -- Class: safe access.
+    local className = safe(function()
+        return inst.ClassName
+    end) or "?"
+
     local kind = classify(inst)
 
-    -- Categorize into per-file collections.
+    -- Categorize.
     if kind == "REMOTE_EVENT" or kind == "REMOTE_FUNCTION"
         or kind == "REMOTE_UNRELIABLE" then
         noteRemote(inst, kind)
@@ -297,38 +298,41 @@ local function walk(inst, depth, prefix)
         stats.tools = stats.tools + 1
     end
 
-    -- Value object capture for the values file.
-    if inst:IsA("StringValue") or inst:IsA("BoolValue")
-        or inst:IsA("NumberValue") or inst:IsA("IntValue") then
+    local isStringValue = safe(function()
+        return inst:IsA("StringValue") or inst:IsA("BoolValue")
+            or inst:IsA("NumberValue") or inst:IsA("IntValue")
+    end)
+    if isStringValue then
         noteValueObject(inst)
     end
 
-    -- GUI text capture for the guitext file.
-    if inst:IsA("TextLabel") or inst:IsA("TextButton")
-        or inst:IsA("TextBox") then
+    local isTextish = safe(function()
+        return inst:IsA("TextLabel")
+            or inst:IsA("TextButton")
+            or inst:IsA("TextBox")
+    end)
+    if isTextish then
         noteGuiText(inst)
     end
 
     -- Structure line.
-    local label = inst.Name
+    local label = name
 
     if CFG.PROPERTY_DUMP then
-        local props = interestingProps(inst)
-        if #props > 0 then
-            label = label .. "  {" .. table.concat(props, ", ") .. "}"
+        local ok, props = pcall(interestingProps, inst)
+        if ok and type(props) == "table" and #props > 0 then
+            label = label .. "  {"
+                .. table.concat(props, ", ") .. "}"
         end
     end
 
-    local line = prefix .. label .. " <" .. inst.ClassName .. ">"
+    local line = prefix .. label .. " <" .. className .. ">"
     if kind then
         line = line .. " [" .. kind .. "]"
     end
     emit(line)
-    table.insert(structureOut, line)
 
-    if CFG.GUI_TEXT
-        and (inst:IsA("TextLabel") or inst:IsA("TextButton")
-            or inst:IsA("TextBox")) then
+    if CFG.GUI_TEXT and isTextish then
         local text = safe(function() return inst.Text end)
         if text and #text > 0 and text ~= "Label" then
             if #text > CFG.MAX_TEXT_LEN then
@@ -338,21 +342,29 @@ local function walk(inst, depth, prefix)
         end
     end
 
-    -- Recurse with sibling dedup.
-    local children = safe(function() return inst:GetChildren() end)
-    if not children or #children == 0 then
+    -- Children: safe access.
+    local children = safe(function()
+        return inst:GetChildren()
+    end)
+    if type(children) ~= "table" or #children == 0 then
         return
     end
 
+    -- Sibling dedup.
     if CFG.DEDUP_SIBLINGS then
         local groups = {}
         local order = {}
         for _, child in ipairs(children) do
-            local key = child.Name .. "\0" .. child.ClassName
+            local childName = safe(function()
+                return child.Name
+            end) or "?"
+            local childClass = safe(function()
+                return child.ClassName
+            end) or "?"
+            local key = childName .. "\0" .. childClass
             if not groups[key] then
                 groups[key] = {
-                    name = child.Name,
-                    class = child.ClassName,
+                    name = childName,
                     list = {},
                 }
                 table.insert(order, key)
@@ -366,13 +378,13 @@ local function walk(inst, depth, prefix)
 
             if count > CFG.DEDUP_MAX_SAMPLE then
                 for s = 1, CFG.DEDUP_MAX_SAMPLE do
-                    walk(group.list[s], depth + 1, prefix .. "   ")
+                    walk(group.list[s], depth + 1,
+                        prefix .. "   ")
                 end
                 emit(prefix .. "   ... x"
                     .. (count - CFG.DEDUP_MAX_SAMPLE)
                     .. " more [" .. group.name .. "]")
 
-                -- Count collapsed siblings for stats + categories.
                 for s = CFG.DEDUP_MAX_SAMPLE + 1, count do
                     local sibling = group.list[s]
                     local k2 = classify(sibling)
@@ -390,39 +402,32 @@ local function walk(inst, depth, prefix)
                 end
             else
                 for s = 1, count do
-                    walk(group.list[s], depth + 1, prefix .. "   ")
+                    walk(group.list[s], depth + 1,
+                        prefix .. "   ")
                 end
+            end
+
+            if stats.nodes % CFG.YIELD_EVERY < 2 then
+                safeYield()
             end
         end
     else
         for _, child in ipairs(children) do
             walk(child, depth + 1, prefix .. "   ")
+            if stats.nodes % CFG.YIELD_EVERY < 2 then
+                safeYield()
+            end
         end
     end
 end
 
 ---------------------------------------------------------------------
--- SECTION 8 : YIELD WRAPPER
+-- SCANS
 ---------------------------------------------------------------------
 
-local function yieldedWalk(inst, depth, prefix)
-    walk(inst, depth, prefix)
-    if stats.nodes % CFG.YIELD_EVERY < 2 then
-        if task and task.wait then
-            task.wait()
-        else
-            wait()
-        end
-    end
-end
-
----------------------------------------------------------------------
--- SECTION 9 : SCAN RUNNER
----------------------------------------------------------------------
-
-log("starting deep scan...")
-
-local player = game:GetService("Players").LocalPlayer
+local player = safe(function()
+    return game:GetService("Players").LocalPlayer
+end)
 
 local function scanService(tag, title, svcName)
     local svc = safe(game.GetService, game, svcName)
@@ -431,20 +436,21 @@ local function scanService(tag, title, svcName)
     end
 
     beginSection(tag, title)
-    local children = safe(function() return svc:GetChildren() end)
-    if children then
+    local children = safe(function()
+        return svc:GetChildren()
+    end)
+    if type(children) == "table" then
         emit("(" .. #children .. " children)")
         for _, child in ipairs(children) do
-            yieldedWalk(child, 1, "   ")
+            walk(child, 1, "   ")
         end
     end
     endSection(tag)
-    log("scanned " .. svcName .. " ("
-        .. stats.nodes .. " nodes)")
+    print("[MAPPER] scanned " .. svcName
+        .. " (" .. stats.nodes .. " nodes)")
 end
 
--- Signal-first order: remotes and scripts land before the huge
--- Workspace tree, so partial scans still contain the gold.
+-- Signal-first order.
 scanService("RS", "REPLICATED STORAGE", "ReplicatedStorage")
 scanService("RF", "REPLICATED FIRST", "ReplicatedFirst")
 scanService("SP", "STARTER PLAYER", "StarterPlayer")
@@ -454,25 +460,28 @@ beginSection("WS", "WORKSPACE")
 local wsChildren = safe(function()
     return workspace:GetChildren()
 end)
-if wsChildren then
+if type(wsChildren) == "table" then
     emit("(" .. #wsChildren .. " children)")
     for _, child in ipairs(wsChildren) do
-        yieldedWalk(child, 1, "   ")
+        walk(child, 1, "   ")
     end
 end
 endSection("WS")
-log("scanned Workspace (" .. stats.nodes .. " nodes)")
+print("[MAPPER] scanned Workspace ("
+    .. stats.nodes .. " nodes)")
 
 if player then
-    beginSection("CH", "CHARACTER: " .. player.Name)
-    local char = player.Character
+    beginSection("CH", "CHARACTER")
+    local char = safe(function() return player.Character end)
     if char then
-        yieldedWalk(char, 1, "   ")
+        walk(char, 1, "   ")
     end
     endSection("CH")
 
     beginSection("PG", "PLAYER GUI (live)")
-    local pg = player:FindFirstChild("PlayerGui")
+    local pg = safe(function()
+        return player:FindFirstChild("PlayerGui")
+    end)
     if pg then
         for _, gui in ipairs(pg:GetChildren()) do
             walk(gui, 1, "   ")
@@ -481,25 +490,29 @@ if player then
     endSection("PG")
 
     beginSection("LS", "LEADERSTATS")
-    local ls = player:FindFirstChild("leaderstats")
+    local ls = safe(function()
+        return player:FindFirstChild("leaderstats")
+    end)
     if ls then
         for _, v in ipairs(ls:GetChildren()) do
             local val = safe(function() return v.Value end)
-            emit("   " .. v.Name .. " = " .. tostring(val))
+            emit("   " .. tostring(safe(function()
+                return v.Name end)) .. " = "
+                .. tostring(val))
         end
     end
     endSection("LS")
 end
 
 ---------------------------------------------------------------------
--- SECTION 10 : BUILD PER-FILE CONTENT
+-- BUILD PER-FILE OUTPUTS
 ---------------------------------------------------------------------
 
 -- REMOTES FILE
+local remotesOut = {}
+table.insert(remotesOut, "==== REMOTES ====")
 table.insert(remotesOut,
-    "==== WINGS OF GLORY REMOTES ====")
-table.insert(remotesOut,
-    "total: " .. stats.remotes .. " remotes")
+    "total: " .. stats.remotes)
 table.insert(remotesOut, "")
 
 local containerNames = {}
@@ -508,6 +521,7 @@ for container in pairs(remotesByContainer) do
 end
 table.sort(containerNames)
 
+local flatRemotes = {}
 for _, container in ipairs(containerNames) do
     local list = remotesByContainer[container]
     table.sort(list)
@@ -515,15 +529,17 @@ for _, container in ipairs(containerNames) do
         "-- container: " .. container .. " (" .. #list .. ")")
     for _, entry in ipairs(list) do
         table.insert(remotesOut, "   " .. entry)
+        table.insert(flatRemotes, container .. " :: " .. entry)
     end
     table.insert(remotesOut, "")
 end
+table.sort(flatRemotes)
 
 -- SCRIPTS FILE
+local scriptsOut = {}
+table.insert(scriptsOut, "==== SCRIPTS ====")
 table.insert(scriptsOut,
-    "==== WINGS OF GLORY SCRIPTS ====")
-table.insert(scriptsOut,
-    "total: " .. stats.scripts .. " scripts")
+    "total: " .. stats.scripts)
 table.insert(scriptsOut, "")
 
 local locationNames = {}
@@ -532,6 +548,7 @@ for location in pairs(scriptsByLocation) do
 end
 table.sort(locationNames)
 
+local flatScripts = {}
 for _, location in ipairs(locationNames) do
     local list = scriptsByLocation[location]
     table.sort(list)
@@ -539,15 +556,17 @@ for _, location in ipairs(locationNames) do
         "-- location: " .. location .. " (" .. #list .. ")")
     for _, entry in ipairs(list) do
         table.insert(scriptsOut, "   " .. entry)
+        table.insert(flatScripts, entry)
     end
     table.insert(scriptsOut, "")
 end
+table.sort(flatScripts)
 
 -- GUI TEXT FILE
+local guiTextOut = {}
+table.insert(guiTextOut, "==== GUI TEXT ====")
 table.insert(guiTextOut,
-    "==== WINGS OF GLORY GUI TEXT ====")
-table.insert(guiTextOut,
-    "total: " .. #guiTexts .. " text elements")
+    "total: " .. #guiTexts)
 table.insert(guiTextOut, "")
 table.sort(guiTexts)
 for _, entry in ipairs(guiTexts) do
@@ -555,86 +574,56 @@ for _, entry in ipairs(guiTexts) do
 end
 
 -- VALUES FILE
+local valuesOut = {}
+table.insert(valuesOut, "==== VALUE OBJECTS ====")
 table.insert(valuesOut,
-    "==== WINGS OF GLORY VALUE OBJECTS ====")
-table.insert(valuesOut,
-    "total: " .. #valueObjects .. " value objects")
+    "total: " .. #valueObjects)
 table.insert(valuesOut, "")
 table.sort(valueObjects)
 for _, entry in ipairs(valueObjects) do
     table.insert(valuesOut, entry)
 end
 
--- STRUCTURE FILE
-table.insert(structureOut, 1,
-    "==== WINGS OF GLORY STRUCTURE ====")
-table.insert(structureOut, 2,
-    "note: sibling-deduped, see wog_summary.txt for counts")
-table.insert(structureOut, 3, "")
+-- STRUCTURE FILE header
+table.insert(structureOut, 1, "==== STRUCTURE ====")
+table.insert(structureOut, 2, "")
+table.insert(structureOut, 3, "(deduped tree)")
 
 -- SUMMARY FILE
-table.insert(summaryOut,
-    "==== WINGS OF GLORY SUMMARY ====")
-table.insert(summaryOut,
-    "nodes: " .. stats.nodes)
-table.insert(summaryOut,
-    "remotes: " .. stats.remotes)
-table.insert(summaryOut,
-    "scripts: " .. stats.scripts)
-table.insert(summaryOut,
-    "parts: " .. stats.parts)
-table.insert(summaryOut,
-    "tools: " .. stats.tools)
-table.insert(summaryOut,
-    "max depth: " .. stats.maxDepth)
+local summaryOut = {}
+table.insert(summaryOut, "==== SUMMARY ====")
+table.insert(summaryOut, "nodes: " .. stats.nodes)
+table.insert(summaryOut, "remotes: " .. stats.remotes)
+table.insert(summaryOut, "scripts: " .. stats.scripts)
+table.insert(summaryOut, "parts: " .. stats.parts)
+table.insert(summaryOut, "tools: " .. stats.tools)
+table.insert(summaryOut, "max depth: " .. stats.maxDepth)
 table.insert(summaryOut, "")
-table.insert(summaryOut,
-    "== ALL REMOTES (flat list) ==")
-
-table.insert(summaryOut, "")
-
----------------------------------------------------------------------
--- SECTION 11 : WRITE FILES
----------------------------------------------------------------------
-
--- (summary remote list rebuilt here for the flat list)
-local flatRemotes = {}
-for _, container in ipairs(containerNames) do
-    for _, entry in ipairs(remotesByContainer[container]) do
-        table.insert(flatRemotes, container .. " :: " .. entry)
-    end
-end
-table.sort(flatRemotes)
-
+table.insert(summaryOut, "== ALL REMOTES ==")
 for _, entry in ipairs(flatRemotes) do
     table.insert(summaryOut, entry)
 end
 table.insert(summaryOut, "")
-table.insert(summaryOut, "== ALL SCRIPTS (flat list) ==")
-
-local flatScripts = {}
-for _, location in ipairs(locationNames) do
-    for _, entry in ipairs(scriptsByLocation[location]) do
-        table.insert(flatScripts, entry)
-    end
-end
-table.sort(flatScripts)
-
+table.insert(summaryOut, "== ALL SCRIPTS ==")
 for _, entry in ipairs(flatScripts) do
     table.insert(summaryOut, entry)
 end
 
+---------------------------------------------------------------------
+-- WRITE FILES
+---------------------------------------------------------------------
+
 local function writeOut(filename, buffer)
-    if type(writefile) ~= "function" then
+    if not canWrite() then
         return false
     end
     local content = table.concat(buffer, "\n")
     local ok = pcall(writefile, filename, content)
     if ok then
-        log("wrote " .. filename .. " ("
-            .. #buffer .. " lines)")
+        print("[MAPPER] wrote " .. filename
+            .. " (" .. #buffer .. " lines)")
     else
-        log("FAILED to write " .. filename)
+        print("[MAPPER] FAILED to write " .. filename)
     end
     return ok
 end
@@ -647,23 +636,11 @@ writeOut(CFG.FILES.VALUES, valuesOut)
 writeOut(CFG.FILES.STRUCTURE, structureOut)
 writeOut(CFG.FILES.SUMMARY, summaryOut)
 
-log("scan complete: " .. lineCount .. " combined lines, "
-    .. stats.nodes .. " nodes")
-
 ---------------------------------------------------------------------
--- SECTION 12 : INTERACTIVE COMMANDS
+-- INTERACTIVE COMMANDS
 ---------------------------------------------------------------------
 
 MAP = {}
-
-function MAP.sections()
-    print("=== SECTIONS (in wogmap.txt) ===")
-    for tag, start in pairs(sectionStart) do
-        local count = (sectionEnd[tag] or lineCount) - start + 1
-        print(string.format("  [%s] lines %d-%d (%d lines)",
-            tag, start, sectionEnd[tag] or lineCount, count))
-    end
-end
 
 function MAP.get(tag)
     local s, e = sectionStart[tag], sectionEnd[tag]
@@ -682,7 +659,7 @@ function MAP.copy(tag)
         print("unknown section: " .. tostring(tag))
         return
     end
-    if type(setclipboard) ~= "function" then
+    if not canClip() then
         print("no clipboard; use MAP.get")
         return
     end
@@ -691,8 +668,7 @@ function MAP.copy(tag)
         table.insert(parts, report[i])
     end
     setclipboard(table.concat(parts, "\n"))
-    print("section [" .. tag .. "] copied ("
-        .. ((e or lineCount) - s + 1) .. " lines)")
+    print("section [" .. tag .. "] copied")
 end
 
 function MAP.find(text)
@@ -703,13 +679,13 @@ function MAP.find(text)
             print(string.format("%5d: %s", i, line))
             hits = hits + 1
             if hits >= 100 then
-                print("(stopping at 100 hits)")
+                print("(stopping at 100)")
                 break
             end
         end
     end
     if hits == 0 then
-        print("no matches for: " .. tostring(text))
+        print("no matches: " .. tostring(text))
     end
 end
 
@@ -728,11 +704,27 @@ function MAP.save()
     writeOut(CFG.FILES.VALUES, valuesOut)
     writeOut(CFG.FILES.STRUCTURE, structureOut)
     writeOut(CFG.FILES.SUMMARY, summaryOut)
-    print("all files rewritten")
+    print("files rewritten")
 end
 
-log("interactive commands ready:")
-log("  MAP.get('RS')   remotes + modules in ReplicatedStorage")
-log("  MAP.copy('RS')  ...to clipboard")
-log("  MAP.find('Gun') search everything")
-log("  MAP.stats()     the numbers")
+---------------------------------------------------------------------
+-- DONE
+---------------------------------------------------------------------
+
+print("[MAPPER] v3 complete: " .. stats.nodes .. " nodes, "
+    .. stats.remotes .. " remotes, "
+    .. stats.scripts .. " scripts")
+
+if canClip() then
+    setclipboard(table.concat({
+        "nodes: " .. stats.nodes,
+        "remotes: " .. stats.remotes,
+        "scripts: " .. stats.scripts,
+        "parts: " .. stats.parts,
+        "max depth: " .. stats.maxDepth,
+    }, "\n"))
+    print("[MAPPER] summary copied to clipboard")
+end
+
+print("[MAPPER] commands: MAP.get('RS') MAP.copy('RS')")
+print("[MAPPER]           MAP.find('Gun') MAP.stats()")
