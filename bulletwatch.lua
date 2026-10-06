@@ -1,23 +1,16 @@
 --=====================================================================
---  BULLETWATCH v1.0
+--  BULLETWATCH v1.1 (fixed)
 --  Purpose: capture weapon-related remote traffic in Wings of Glory
---  Layout : compact draggable CoreGui panel, live feed, verb filter
+--  Layout : compact draggable CoreGui panel, live feed
 --
---  What it catches:
---    - Every InvokeServer/FireServer call whose arg1 looks like a
---      weapon/fire/hit/damage verb, OR whose any arg mentions
---      Gun/Bullet/Missile/Bomb/Damage/Hit
---    - Every call made while you are actively firing (context flag)
---
---  Controls:
---    Feed auto-scrolls. "CLR" clears. Filter box narrows the feed.
+--  Red rows = call fired while trigger held
+--  Gray rows = call args contain weapon keywords
 --=====================================================================
 
-print("[BulletWatch] booting")
+print("[BulletWatch] v1.1 booting")
 
 local Players = game:GetService("Players")
-local TweenService = game:GetService("TweenService")
-local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 if not player then
@@ -30,7 +23,7 @@ end
 ---------------------------------------------------------------------
 
 local CFG = {
-    MAX_ROWS = 40,          -- visible feed rows
+    MAX_ROWS = 40,
     KEYWORDS = {
         "fire", "shoot", "shot", "gun", "bullet", "cannon",
         "missile", "bomb", "ordnance", "rocket",
@@ -38,32 +31,35 @@ local CFG = {
         "explode", "impact", "projectile", "ammo", "weapon",
         "spawn", "lock", "flare", "countermeasure", "chaff",
     },
-    KEYWORD_CHECK_DEPTH = 3, -- how deep into table args to search
-    CONTEXT_WINDOW = 2.0,    -- seconds after keypress to tag "while firing"
+    KEYWORD_CHECK_DEPTH = 3,
 }
 
 ---------------------------------------------------------------------
--- STATE
+-- STATE (all forward declarations first)
 ---------------------------------------------------------------------
 
-local captureLog = {}     -- all captured entries
+local captureLog = {}
 local captureCount = 0
-local isFiring = false    -- true while mouse/space held
-local lastFireTime = 0
+local isFiring = false
+local lastRender = 0
 
--- firing detection: mouse button 1, space, and the mobile fire button
-local UserInputService = game:GetService("UserInputService")
+local UI_refresh = nil   -- assigned later by UI section
+
+---------------------------------------------------------------------
+-- FIRING DETECTION
+---------------------------------------------------------------------
 
 UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
+    if processed then
+        return
+    end
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.KeyCode == Enum.KeyCode.Space then
         isFiring = true
-        lastFireTime = os.clock()
     end
 end)
 
-UserInputService.InputEnded:Connect(input)
+UserInputService.InputEnded:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.KeyCode == Enum.KeyCode.Space then
         isFiring = false
@@ -73,8 +69,6 @@ end)
 ---------------------------------------------------------------------
 -- KEYWORD MATCHING
 ---------------------------------------------------------------------
--- Checks a value tree for keyword hits. Returns the matched word
--- or nil.
 
 local function containsKeyword(value, depth)
     if depth > CFG.KEYWORD_CHECK_DEPTH then
@@ -113,14 +107,18 @@ local function containsKeyword(value, depth)
 end
 
 ---------------------------------------------------------------------
--- SNAPSHOT (light: enough to render, not to round-trip)
+-- ARG SNAPSHOT (light)
 ---------------------------------------------------------------------
 
 local function snapArg(v, depth)
-    if depth > 2 then return "{...}" end
+    if depth > 2 then
+        return "{...}"
+    end
     local t = typeof(v)
     if t == "string" then
-        if #v > 40 then return v:sub(1, 40) .. "..." end
+        if #v > 40 then
+            return v:sub(1, 40) .. "..."
+        end
         return v
     elseif t == "number" then
         return tostring(v)
@@ -167,17 +165,14 @@ if type(oldNamecall) ~= "function" then
 end
 
 local function shouldLog(method, args, count)
-    -- Only outgoing calls
     if method ~= "InvokeServer" and method ~= "FireServer" then
         return false
     end
 
-    -- Always log calls made while firing (context flag)
     if isFiring then
         return true
     end
 
-    -- Otherwise require a keyword hit in the args
     for i = 1, count do
         if containsKeyword(args[i], 0) then
             return true
@@ -186,43 +181,50 @@ local function shouldLog(method, args, count)
     return false
 end
 
+local function recordCall(self, method, args, count)
+    captureCount = captureCount + 1
+
+    local prev = {}
+    for i = 1, math.min(count, 3) do
+        table.insert(prev, snapArg(args[i], 0))
+    end
+
+    local entry = {
+        id = captureCount,
+        time = os.clock(),
+        method = method,
+        remoteName = self.Name,
+        remotePath = self:GetFullName(),
+        whileFiring = isFiring,
+        preview = table.concat(prev, " | "),
+    }
+
+    table.insert(captureLog, entry)
+    if #captureLog > 500 then
+        table.remove(captureLog, 1)
+    end
+
+    if UI_refresh then
+        local okR, errR = pcall(UI_refresh, entry)
+        if not okR then
+            print("[BulletWatch] render error: " .. tostring(errR))
+        end
+    end
+end
+
 local replacement
+
 if type(newcclosure) == "function" then
     replacement = newcclosure(function(self, ...)
         local method = getnamecallmethod()
         local args = { ... }
         local count = select("#", ...)
-
         if shouldLog(method, args, count) then
-            captureCount = captureCount + 1
-
-            local entry = {
-                id = captureCount,
-                time = os.clock(),
-                method = method,
-                remoteName = self.Name,
-                remotePath = self:GetFullName(),
-                whileFiring = isFiring,
-                preview = "",
-            }
-
-            -- build preview from first few args
-            local prev = {}
-            for i = 1, math.min(count, 3) do
-                table.insert(prev, snapArg(args[i], 0))
-            end
-            entry.preview = table.concat(prev, " | ")
-
-            table.insert(captureLog, entry)
-            if #captureLog > 500 then
-                table.remove(captureLog, 1)
-            end
-
-            if UI_refresh then
-                UI_refresh(entry)
+            local okC, errC = pcall(recordCall, self, method, args, count)
+            if not okC then
+                print("[BulletWatch] record error: " .. tostring(errC))
             end
         end
-
         return oldNamecall(self, ...)
     end)
 else
@@ -230,32 +232,12 @@ else
         local method = getnamecallmethod()
         local args = { ... }
         local count = select("#", ...)
-
         if shouldLog(method, args, count) then
-            captureCount = captureCount + 1
-            local entry = {
-                id = captureCount,
-                time = os.clock(),
-                method = method,
-                remoteName = self.Name,
-                remotePath = self:GetFullName(),
-                whileFiring = isFiring,
-                preview = "",
-            }
-            local prev = {}
-            for i = 1, math.min(count, 3) do
-                table.insert(prev, snapArg(args[i], 0))
-            end
-            entry.preview = table.concat(prev, " | ")
-            table.insert(captureLog, entry)
-            if #captureLog > 500 then
-                table.remove(captureLog, 1)
-            end
-            if UI_refresh then
-                UI_refresh(entry)
+            local okC, errC = pcall(recordCall, self, method, args, count)
+            if not okC then
+                print("[BulletWatch] record error: " .. tostring(errC))
             end
         end
-
         return oldNamecall(self, ...)
     end
 end
@@ -267,16 +249,14 @@ setreadonly(mt, true)
 print("[BulletWatch] hook installed")
 
 ---------------------------------------------------------------------
--- UI : compact CoreGui panel
+-- UI
 ---------------------------------------------------------------------
 
 local T = {
     bg      = Color3.fromRGB(16, 16, 22),
     card    = Color3.fromRGB(28, 28, 36),
     border  = Color3.fromRGB(46, 46, 58),
-    accent  = Color3.fromRGB(255, 170, 60),
     fire    = Color3.fromRGB(232, 92, 92),
-    normal  = Color3.fromRGB(88, 200, 132),
     text    = Color3.fromRGB(238, 238, 242),
     dim     = Color3.fromRGB(156, 156, 170),
     faint   = Color3.fromRGB(104, 104, 118),
@@ -294,7 +274,9 @@ local function new(class, props)
             inst[k] = v
         end
     end
-    if parent then inst.Parent = parent end
+    if parent then
+        inst.Parent = parent
+    end
     return inst
 end
 
@@ -325,7 +307,6 @@ local panel = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(0, 8), Parent = panel })
 new("UIStroke", { Color = T.border, Thickness = 1, Parent = panel })
 
--- Title bar
 local titleBar = new("Frame", {
     Size = UDim2.new(1, 0, 0, 28),
     BackgroundColor3 = T.bg,
@@ -335,7 +316,7 @@ local titleBar = new("Frame", {
 new("UICorner", { CornerRadius = UDim.new(0, 8), Parent = titleBar })
 
 new("TextLabel", {
-    Size = UDim2.new(1, -90, 1, 0),
+    Size = UDim2.new(1, -100, 1, 0),
     Position = UDim2.new(0, 10, 0, 0),
     BackgroundTransparency = 1,
     Text = "BulletWatch",
@@ -348,7 +329,7 @@ new("TextLabel", {
 
 local fireIndicator = new("TextLabel", {
     Size = UDim2.fromOffset(80, 16),
-    Position = UDim2.new(1, -86, 0, 6),
+    Position = UDim2.new(1, -130, 0, 6),
     BackgroundColor3 = T.rowbg,
     BorderSizePixel = 0,
     Text = " idle",
@@ -359,26 +340,9 @@ local fireIndicator = new("TextLabel", {
 })
 new("UICorner", { CornerRadius = UDim.new(0, 4), Parent = fireIndicator })
 
--- Fire indicator live update
-task.spawn(function()
-    while gui.Parent do
-        if isFiring then
-            fireIndicator.Text = " FIRING"
-            fireIndicator.TextColor3 = T.fire
-            fireIndicator.BackgroundColor3 = T.rowFire
-        else
-            fireIndicator.Text = " idle"
-            fireIndicator.TextColor3 = T.faint
-            fireIndicator.BackgroundColor3 = T.rowbg
-        end
-        task.wait(0.1)
-    end
-end)
-
--- Clear button
 local clrBtn = new("TextButton", {
     Size = UDim2.fromOffset(40, 20),
-    Position = UDim2.new(1, -46, 1, -4),
+    Position = UDim2.new(1, -46, 0, 4),
     BackgroundColor3 = T.fire,
     BorderSizePixel = 0,
     Text = "CLR",
@@ -389,7 +353,6 @@ local clrBtn = new("TextButton", {
 })
 new("UICorner", { CornerRadius = UDim.new(0, 4), Parent = clrBtn })
 
--- Feed
 local feed = new("ScrollingFrame", {
     Size = UDim2.new(1, -16, 1, -44),
     Position = UDim2.new(0, 8, 0, 34),
@@ -407,7 +370,7 @@ new("UIListLayout", {
     Parent = feed,
 })
 
--- Rows (pooled: created once, updated in place)
+-- pooled rows
 local rows = {}
 
 local function makeRow()
@@ -451,27 +414,31 @@ local function makeRow()
 end
 
 for i = 1, CFG.MAX_ROWS do
-    table.insert(rows, makeRow())
+    local row = makeRow()
+    row.Visible = false
+    table.insert(rows, row)
 end
 
 local function renderRows()
-    -- newest at top, pooled rows updated in place
     local n = #captureLog
     local start = math.max(1, n - CFG.MAX_ROWS + 1)
     local idx = 0
+
     for i = n, start, -1 do
         idx = idx + 1
-        local entry = captureLog[i]
         local row = rows[idx]
-        if not row then break end
+        if not row then
+            break
+        end
 
-        row.LayoutOrder = entry.id
+        local entry = captureLog[i]
+
         row.Visible = true
+        row.LayoutOrder = entry.id
 
         local tag = entry.whileFiring and "FIRE" or "kw"
-        local remoteLabel = string.format("#%d [%s] %s:%s",
+        row.line1.Text = string.format("#%d [%s] %s:%s",
             entry.id, tag, entry.remoteName, entry.method)
-        row.line1.Text = remoteLabel
         row.line2.Text = entry.preview or ""
 
         if entry.whileFiring then
@@ -483,25 +450,38 @@ local function renderRows()
         end
     end
 
-    -- hide unused rows
     for i = idx + 1, #rows do
         rows[i].Visible = false
     end
 
     feed.CanvasSize = UDim2.new(0, 0, 0, idx * 32)
-    -- auto-scroll to top (newest)
     feed.CanvasPosition = Vector2.new(0, 0)
 end
 
--- throttle UI updates
-local lastRender = 0
-UI_refresh = function(entry)
+-- throttled refresh assignment
+UI_refresh = function()
     local now = os.clock()
     if now - lastRender > 0.1 then
         lastRender = now
         renderRows()
     end
 end
+
+-- fire indicator loop
+task.spawn(function()
+    while gui.Parent do
+        if isFiring then
+            fireIndicator.Text = " FIRING"
+            fireIndicator.TextColor3 = T.fire
+            fireIndicator.BackgroundColor3 = T.rowFire
+        else
+            fireIndicator.Text = " idle"
+            fireIndicator.TextColor3 = T.faint
+            fireIndicator.BackgroundColor3 = T.rowbg
+        end
+        task.wait(0.1)
+    end
+end)
 
 clrBtn.MouseButton1Click:Connect(function()
     captureLog = {}
@@ -511,6 +491,5 @@ end)
 
 renderRows()
 
-print("[BulletWatch] active. Fly, fire guns, launch missiles.")
-print("[BulletWatch] feed shows weapon-related calls only.")
-print("[BulletWatch] red rows = call happened while trigger held")
+print("[BulletWatch] active")
+print("[BulletWatch] fly, hold fire, launch missiles - watch red rows")
